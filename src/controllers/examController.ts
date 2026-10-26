@@ -1,0 +1,895 @@
+import { Request, Response } from 'express';
+import { z } from 'zod';
+import { ExamApplication } from '../models/examApplicationModel';
+import { HallTicket } from '../models/hallTicketModel';
+import { Student } from '../models/studentModel';
+import { Institute } from '../models/instituteModel';
+import { Course } from '../models/courseModel';
+import { Batch } from '../models/batchModel';
+import { FeeRecord } from '../models/feeRecordModel';  // ← ADD THIS IMPORT
+import { User } from '../models/userModel';
+import notificationService from '../services/notificationService';
+import { sendSuccess, sendError } from '../utils/responseFormatter';
+import { emitEvent } from '../config/socket';
+import { classifyStudentsForExamFee, checkStudentReappearance, resolveFeeConfiguration } from '../services/examFeeService';
+import { getFileUrl } from '../utils/fileHelpers';
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/** Resolve the institute document for the logged-in institute user */
+const resolveInstitute = async (userId: string) =>
+  Institute.findOne({ user: userId, status: 'Approved' });
+
+/** Ensure the institute role user owns this application */
+const assertOwnership = async (application: any, userId: string) => {
+  const institute = await Institute.findOne({ user: userId });
+  if (!institute) return false;
+  const appInstituteId = application.institute?._id || application.institute;
+  return institute._id.toString() === appInstituteId.toString();
+};
+
+// ─── Zod Schemas ──────────────────────────────────────────────────────────────
+
+const parseJsonArray = (val: unknown): unknown => {
+  if (typeof val === 'string') {
+    try { return JSON.parse(val); } catch { return [val]; }
+  }
+  return val;
+};
+
+const jsonStringArray = z.preprocess(parseJsonArray, z.array(z.string().min(1)));
+
+const examApplySchema = z.object({
+  courseId:   z.string().min(1, 'Course ID is required'),
+  batchId:    z.string().min(1, 'Batch ID is required'),
+  examinationNumber: z.coerce.number().min(1, 'Examination Number is required').max(2),
+  studentIds: z.preprocess(parseJsonArray, z.array(z.string().min(1)).min(1, 'At least one student must be selected')),
+  utrNumber:  z.string().optional(),
+  subjects:   z.preprocess(parseJsonArray, z.array(z.string().min(1)).min(1, 'At least one subject is required')),
+});
+
+const examUpdateSchema = z.object({
+  subjects:   z.preprocess(parseJsonArray, z.array(z.string().min(1)).min(1)).optional(),
+  studentIds: z.array(z.string().min(1)).min(1).optional(),
+});
+
+const reviewExamSchema = z.object({
+  status:        z.enum(['Approved', 'Rejected']),
+  scheduledDate: z.string().optional().transform(val => val ? new Date(val) : undefined),
+  remarks:       z.string().optional(),
+});
+
+const publishScheduleSchema = z.object({
+  examVenue:     z.string().min(1, 'Exam venue is required'),
+  examCenter:    z.string().min(1, 'Exam center is required'),
+  reportingTime: z.string().min(1, 'Reporting time is required'),
+  scheduledDate: z.string().optional().transform(val => val ? new Date(val) : undefined),
+  subjectSchedules: z.array(z.object({
+    subject: z.string(),
+    date: z.string().transform(val => new Date(val)),
+    time: z.string()
+  })).optional(),
+  // NEW: Practical exam fields
+  practicalExam: z.object({
+    name:     z.string().optional(),
+    venue:    z.string().optional(),
+    date:     z.string().optional().transform(val => val ? new Date(val) : undefined),
+    time:     z.string().optional(),
+    subjects: z.array(z.string()).optional()
+  }).optional(),
+});
+
+// ─── UC 4.1: Apply for Exam (Institute) ──────────────────────────────────────
+
+export const applyForExam = async (req: Request, res: Response) => {
+  try {
+    const validatedData = examApplySchema.parse(req.body);
+
+    const institute = await resolveInstitute(req.user._id);
+    if (!institute) {
+      return sendError({ req, res, statusCode: 403, message: 'Access Denied: Your institute application is not approved yet.' });
+    }
+
+    // Optional exam fee receipt
+    const files = req.files as { [fieldname: string]: Express.Multer.File[] };
+    const examFeeReceiptUrl = files?.['examFeeReceipt']?.length ? getFileUrl(files['examFeeReceipt'][0].path) : undefined;
+
+    // Verify course & batch
+    const course = await Course.findOne({ _id: validatedData.courseId });
+    if (!course) return sendError({ req, res, statusCode: 404, message: 'Specified Course does not exist.' });
+
+    const batch = await Batch.findOne({ _id: validatedData.batchId, course: course._id });
+    if (!batch) return sendError({ req, res, statusCode: 404, message: 'Specified Batch does not exist for this course.' });
+
+    // Validate students belong to this institute, course, AND batch
+    const students = await Student.find({
+      _id: { $in: validatedData.studentIds },
+      institute: institute._id,
+      course: course._id,
+      batch: batch._id,
+    });
+
+    if (students.length !== validatedData.studentIds.length) {
+      return sendError({ req, res, statusCode: 400, message: 'One or more students do not exist or do not belong to the specified batch.' });
+    }
+
+    const unapprovedStudents = students.filter((s: any) => s.verificationStatus && s.verificationStatus !== 'Approved');
+    if (unapprovedStudents.length > 0) {
+      return sendError({
+        req,
+        res,
+        statusCode: 400,
+        message: `Cannot enroll unverified students for examinations. ${unapprovedStudents.length} student(s) have verification status: Pending or Correction Required.`
+      });
+    }
+
+    // Mandatory Course Completion Certificates Check (At least one: NBLS / NCLS / NTLS / NULS)
+    const missingCertificateStudents = students.filter((s: any) => {
+      const hasNbls = !!s.documents?.nblsCertificateUrl;
+      const hasNcls = !!s.documents?.nclsCertificateUrl;
+      const hasNtls = !!s.documents?.ntlsCertificateUrl;
+      const hasNuls = !!s.documents?.nulsCertificateUrl;
+      return !(hasNbls || hasNcls || hasNtls || hasNuls);
+    });
+
+    if (missingCertificateStudents.length > 0) {
+      const names = missingCertificateStudents.map((s: any) => `${s.firstName} ${s.lastName}`);
+
+      return sendError({
+        req,
+        res,
+        statusCode: 400,
+        message: `Mandatory Course Completion Certificate missing. At least one course completion certificate (NBLS, NCLS, NTLS, or NULS) must be uploaded before examination for: ${names.join(', ')}.`
+      });
+    }
+
+    // ── NEW: Classify students (first-attempt vs reappearing) & resolve fee ──
+    const feeSummary = await classifyStudentsForExamFee(
+      validatedData.studentIds,
+      validatedData.examinationNumber,
+      course
+    );
+
+    // Fetch fee records for examination fees
+    const feeRecords = await FeeRecord.find({
+      student: { $in: validatedData.studentIds },
+      examinationNumber: validatedData.examinationNumber,
+      paymentPurpose: 'Examination fee'
+    });
+    const paidStudentIds = new Set(feeRecords.map((f: any) => f.student.toString()));
+
+    // Students who owe a fee must have paid it:
+    // - reappearing students always pay when a reappearing fee is configured;
+    // - first-attempt students pay only when the course opts to charge them.
+    const { feeConfig } = feeSummary;
+    const feeRequiredSet = new Set(
+      feeConfig.reappearingFee > 0 ? feeSummary.reappearingStudents : []
+    );
+    if (feeConfig.feeApplicableForFirstAttempt && feeConfig.firstAttemptFee > 0) {
+      feeSummary.firstAttemptStudents.forEach((id) => feeRequiredSet.add(id));
+    }
+
+    // Eligibility check
+    const ineligible = students.filter(s => {
+      const sem = s.examinations.find((sm: any) => sm.examinationNumber === validatedData.examinationNumber);
+      if (!sem) return true; // ineligible if no examination record
+
+      const feeSatisfied = !feeRequiredSet.has(s._id.toString()) || paidStudentIds.has(s._id.toString());
+      return !(sem.attendancePercentage >= 75 && sem.thesisApproved && feeSatisfied);
+    });
+
+    if (ineligible.length > 0) {
+      return sendError({
+        req, res, statusCode: 400,
+        message: 'Cannot apply for exam. One or more selected students are ineligible.',
+        errors: ineligible.map(s => ({ studentId: s._id, name: `${s.firstName} ${s.lastName}`, reason: 'Ineligible student criteria not met (attendance, thesis, or applicable exam fee) for this examination' })),
+      });
+    }
+
+    // Duplicate check per batch & examination number
+    const existingBatchApp = await ExamApplication.findOne({
+      institute: institute._id,
+      course: course._id,
+      batch: batch._id,
+      examinationNumber: validatedData.examinationNumber,
+      status: { $in: ['Pending', 'Approved', 'SchedulePublished'] },
+    });
+    if (existingBatchApp) {
+      return sendError({ req, res, statusCode: 400, message: `An active exam application already exists for this batch (${batch.name}) and Examination ${validatedData.examinationNumber}.` });
+    }
+
+    // Duplicate check per student
+    const existingStudentApp = await ExamApplication.findOne({
+      examinationNumber: validatedData.examinationNumber,
+      students: { $in: validatedData.studentIds },
+      status: { $in: ['Pending', 'Approved', 'SchedulePublished'] },
+    });
+    if (existingStudentApp) {
+      return sendError({ req, res, statusCode: 400, message: 'One or more selected students already have an active exam application for this examination.' });
+    }
+
+    const application = await ExamApplication.create({
+      institute: institute._id,
+      course: course._id,
+      batch: batch._id,
+      examinationNumber: validatedData.examinationNumber,
+      students: validatedData.studentIds,
+      subjects: validatedData.subjects,
+      status: 'Pending',
+      utrNumber: validatedData.utrNumber,
+      examFeeReceiptUrl,
+      examFeeApplicable: feeSummary.examFeeApplicable,
+      examFeeAmount: feeSummary.examFeeAmount,
+      reappearingFeeAmount: feeSummary.reappearingFeeAmount,
+      firstAttemptFeeAmount: feeSummary.firstAttemptFeeAmount,
+      reappearingStudents: feeSummary.reappearingStudents,
+      firstAttemptStudents: feeSummary.firstAttemptStudents,
+    });
+
+    emitEvent('EXAM_APPLICATION_UPDATED', { applicationId: application._id, status: 'Pending' });
+
+    // Send confirmation email to institute + notification to academy
+    try {
+      const user = await User.findById(institute.user);
+      await notificationService.notifyExamApplicationSubmitted({
+        instituteName: institute.orgName,
+        instituteEmail: user?.email || institute.emailAddress,
+        courseName: course.name,
+        examinationNumber: validatedData.examinationNumber,
+        subjects: validatedData.subjects,
+        totalFee: 0,
+        paymentId: validatedData.utrNumber || 'N/A',
+        studentsCount: validatedData.studentIds.length,
+      });
+    } catch (emailErr: any) {
+      console.error('Failed to send exam application notification:', emailErr);
+    }
+
+    return sendSuccess({ req, res, statusCode: 201, message: 'Exam application submitted successfully', data: application });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) throw error;
+    return sendError({ req, res, statusCode: 500, message: error.message });
+  }
+};
+
+// ─── GET All Exam Applications ────────────────────────────────────────────────
+
+export const listExamApplications = async (req: Request, res: Response) => {
+  try {
+    const query: any = {};
+
+    // Optional filters
+    if (req.query.status)  query.status  = req.query.status;
+    if (req.query.courseId) query.course = req.query.courseId;
+    if (req.query.batchId)  query.batch  = req.query.batchId;
+
+    if (req.user.role === 'institute') {
+      const institute = await resolveInstitute(req.user._id);
+      if (!institute) return sendError({ req, res, statusCode: 403, message: 'Access Denied: Your institute application is not approved yet.' });
+      query.institute = institute._id;
+    }
+
+    const applications = await ExamApplication.find(query)
+      .populate('institute', 'orgName')
+      .populate('course', 'name')
+      .populate('batch', 'name year')
+      .populate('students', 'firstName lastName enrollmentId email')
+      .sort({ createdAt: -1 });
+
+    return sendSuccess({ req, res, message: 'Exam applications retrieved successfully', data: applications });
+  } catch (error: any) {
+    return sendError({ req, res, statusCode: 500, message: error.message });
+  }
+};
+
+// ─── GET Exam Application by ID ───────────────────────────────────────────────
+
+export const getExamApplicationById = async (req: Request, res: Response) => {
+  try {
+    const application = await ExamApplication.findById(req.params.id)
+      .populate('institute', 'orgName instituteAddress')
+      .populate('course', 'name')
+      .populate('batch', 'name year')
+      .populate('students', 'firstName lastName enrollmentId email attendancePercentage thesisApproved remittedToAcademy examAttempts');
+
+    if (!application) return sendError({ req, res, statusCode: 404, message: 'Exam application not found' });
+
+    if (req.user.role === 'institute') {
+      const owns = await assertOwnership(application, req.user._id);
+      if (!owns) return sendError({ req, res, statusCode: 403, message: 'Unauthorized to access this application' });
+    }
+
+    return sendSuccess({ req, res, message: 'Exam application retrieved successfully', data: application });
+  } catch (error: any) {
+    return sendError({ req, res, statusCode: 500, message: error.message });
+  }
+};
+
+// ─── UPDATE Exam Application (Institute — Pending only) ───────────────────────
+
+export const updateExamApplication = async (req: Request, res: Response) => {
+  try {
+    const validatedData = examUpdateSchema.parse(req.body);
+
+    const institute = await resolveInstitute(req.user._id);
+    if (!institute) return sendError({ req, res, statusCode: 403, message: 'Access Denied: Your institute application is not approved yet.' });
+
+    const application = await ExamApplication.findOne({ _id: req.params.id, institute: institute._id });
+    if (!application) return sendError({ req, res, statusCode: 404, message: 'Exam application not found or unauthorized' });
+
+    if (application.status !== 'Pending') {
+      return sendError({ req, res, statusCode: 400, message: 'Only Pending applications can be updated.' });
+    }
+
+    if (validatedData.subjects?.length) application.subjects = validatedData.subjects;
+
+    if (validatedData.studentIds?.length) {
+      const students = await Student.find({
+        _id: { $in: validatedData.studentIds },
+        institute: institute._id,
+        course: application.course,
+        batch: application.batch,
+      });
+      if (students.length !== validatedData.studentIds.length) {
+        return sendError({ req, res, statusCode: 400, message: 'One or more students do not exist or do not belong to this course/batch.' });
+      }
+      const feeRecords = await FeeRecord.find({
+        student: { $in: validatedData.studentIds },
+        examinationNumber: application.examinationNumber,
+        paymentPurpose: 'Examination fee'
+      });
+      const paidStudentIds = new Set(feeRecords.map((f: any) => f.student.toString()));
+
+      // ── NEW: Recompute fee classification for the updated students ──
+      const course = await Course.findById(application.course);
+      const feeSummary = await classifyStudentsForExamFee(
+        validatedData.studentIds,
+        application.examinationNumber,
+        course
+      );
+      const { feeConfig } = feeSummary;
+      const feeRequiredSet = new Set(
+        feeConfig.reappearingFee > 0 ? feeSummary.reappearingStudents : []
+      );
+      if (feeConfig.feeApplicableForFirstAttempt && feeConfig.firstAttemptFee > 0) {
+        feeSummary.firstAttemptStudents.forEach((id) => feeRequiredSet.add(id));
+      }
+
+      const ineligible = students.filter(s => {
+        const sem = s.examinations.find((sm: any) => sm.examinationNumber === application.examinationNumber);
+        if (!sem) return true;
+        const feeSatisfied = !feeRequiredSet.has(s._id.toString()) || paidStudentIds.has(s._id.toString());
+        return !(sem.attendancePercentage >= 75 && sem.thesisApproved && feeSatisfied);
+      });
+
+      if (ineligible.length > 0) {
+        return sendError({
+          req, res, statusCode: 400,
+          message: 'One or more updated students are ineligible.',
+          errors: ineligible.map(s => ({ studentId: s._id, name: `${s.firstName} ${s.lastName}`, reason: 'Ineligible student criteria not met (attendance, thesis, or applicable exam fee) for this examination' })),
+        });
+      }
+      application.students = validatedData.studentIds.map((id: string) => id as any);
+      application.examFeeApplicable = feeSummary.examFeeApplicable;
+      application.examFeeAmount = feeSummary.examFeeAmount;
+      application.reappearingFeeAmount = feeSummary.reappearingFeeAmount;
+      application.firstAttemptFeeAmount = feeSummary.firstAttemptFeeAmount;
+      application.reappearingStudents = feeSummary.reappearingStudents as any;
+      application.firstAttemptStudents = feeSummary.firstAttemptStudents as any;
+    }
+
+    await application.save();
+    return sendSuccess({ req, res, message: 'Exam application updated successfully', data: application });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) throw error;
+    return sendError({ req, res, statusCode: 500, message: error.message });
+  }
+};
+
+// ─── DELETE Exam Application (Institute — Pending only) ───────────────────────
+
+export const deleteExamApplication = async (req: Request, res: Response) => {
+  try {
+    const institute = await resolveInstitute(req.user._id);
+    if (!institute) return sendError({ req, res, statusCode: 403, message: 'Access Denied: Your institute application is not approved yet.' });
+
+    const application = await ExamApplication.findOne({ _id: req.params.id, institute: institute._id });
+    if (!application) return sendError({ req, res, statusCode: 404, message: 'Exam application not found or unauthorized' });
+
+    if (application.status !== 'Pending') {
+      return sendError({ req, res, statusCode: 400, message: 'Only Pending applications can be cancelled/deleted.' });
+    }
+
+    await ExamApplication.findByIdAndDelete(req.params.id);
+    return sendSuccess({ req, res, message: 'Exam application cancelled and deleted successfully', data: { deletedId: req.params.id } });
+  } catch (error: any) {
+    return sendError({ req, res, statusCode: 500, message: error.message });
+  }
+};
+
+// ─── UC 4.2 Step 1: Review Exam Application (Board) ──────────────────────────
+
+export const reviewExamApplication = async (req: Request, res: Response) => {
+  try {
+    const validatedData = reviewExamSchema.parse(req.body);
+
+    const application = await ExamApplication.findById(req.params.id);
+    if (!application) return sendError({ req, res, statusCode: 404, message: 'Exam application not found' });
+
+    if (application.status !== 'Pending') {
+      return sendError({ req, res, statusCode: 400, message: `Cannot review an application with status "${application.status}". Only Pending applications can be reviewed.` });
+    }
+
+    if (validatedData.status === 'Approved' && !validatedData.scheduledDate) {
+      return sendError({ req, res, statusCode: 400, message: 'A scheduled date is required to approve the exam application.' });
+    }
+
+    application.status = validatedData.status;
+    application.remarks = validatedData.remarks || application.remarks;
+
+    if (validatedData.status === 'Approved') {
+      application.scheduledDate = validatedData.scheduledDate;
+    } else {
+      // Rejected — clear schedule data
+      application.scheduledDate       = undefined;
+      application.examVenue           = undefined;
+      application.examCenter          = undefined;
+      application.reportingTime       = undefined;
+      application.schedulePublishedAt = undefined;
+      application.hallTicketsGenerated = false;
+    }
+
+    await application.save();
+
+    // Synchronize Student.examinations[].eligibilityStatus for each candidate in this batch application
+    if (application.students && application.students.length > 0) {
+      const studentEligibilityStatus = validatedData.status === 'Approved' ? 'Approved' : 'Rejected';
+      await Student.updateMany(
+        {
+          _id: { $in: application.students },
+          'examinations.examinationNumber': application.examinationNumber,
+        },
+        {
+          $set: {
+            'examinations.$.eligibilityStatus': studentEligibilityStatus,
+          },
+        }
+      );
+    }
+
+    // Notify institute when the application is approved
+    if (validatedData.status === 'Approved') {
+      try {
+        const [instituteDoc, courseDoc] = await Promise.all([
+          Institute.findById(application.institute).populate('user'),
+          Course.findById(application.course),
+        ]);
+        if (instituteDoc) {
+          const instituteUser = (instituteDoc as any).user as any;
+          await notificationService.notifyExamApplicationApproved({
+            instituteName: instituteDoc.orgName,
+            instituteEmail: instituteUser?.email || instituteDoc.emailAddress,
+            courseName: courseDoc?.name || 'N/A',
+            examinationNumber: application.examinationNumber,
+            examDate: application.scheduledDate || new Date(),
+            remarks: validatedData.remarks || 'Approved by Academic Board',
+          });
+        }
+      } catch (emailErr: any) {
+        console.error('Failed to send exam approval notification:', emailErr);
+      }
+    }
+
+    return sendSuccess({ req, res, message: `Exam application ${validatedData.status.toLowerCase()} successfully`, data: application });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) throw error;
+    return sendError({ req, res, statusCode: 500, message: error.message });
+  }
+};
+
+// ─── UC 4.2 Step 2: Publish Exam Schedule (Board) ────────────────────────────
+
+export const publishExamSchedule = async (req: Request, res: Response) => {
+  try {
+    const validatedData = publishScheduleSchema.parse(req.body);
+
+    const application = await ExamApplication.findById(req.params.id)
+      .populate('institute', 'orgName')
+      .populate('course', 'name')
+      .populate('batch', 'name year');
+
+    if (!application) return sendError({ req, res, statusCode: 404, message: 'Exam application not found' });
+
+    if (application.status !== 'Approved') {
+      return sendError({ req, res, statusCode: 400, message: `Cannot publish schedule for an application with status "${application.status}". Application must be Approved first.` });
+    }
+
+    // Update schedule details
+    application.examVenue           = validatedData.examVenue;
+    application.examCenter          = validatedData.examCenter;
+    application.reportingTime       = validatedData.reportingTime;
+    application.schedulePublishedAt = new Date();
+    application.status              = 'SchedulePublished';
+    
+    if (validatedData.subjectSchedules) {
+      application.subjectSchedules = validatedData.subjectSchedules;
+    }
+
+    // NEW: Save practical exam details
+    if (validatedData.practicalExam) {
+      application.practicalExam = {
+        name:     validatedData.practicalExam.name     || 'Practical Examination',
+        venue:    validatedData.practicalExam.venue    || '',
+        date:     validatedData.practicalExam.date,
+        time:     validatedData.practicalExam.time     || '',
+        subjects: validatedData.practicalExam.subjects || [],
+      };
+    }
+
+    // Allow updating the scheduled date if provided
+    if (validatedData.scheduledDate) {
+      application.scheduledDate = validatedData.scheduledDate;
+    }
+
+    await application.save();
+
+    // Send schedule published email to institute
+    try {
+      const instituteDoc = await Institute.findById(application.institute).populate('user');
+      if (instituteDoc) {
+        const instituteUser = (instituteDoc as any).user as any;
+        await notificationService.notifyExamSchedulePublished({
+          instituteName: instituteDoc.orgName,
+          instituteEmail: instituteUser?.email || instituteDoc.emailAddress,
+          courseName: (application as any).course?.name || 'N/A',
+          examinationNumber: application.examinationNumber,
+          examVenue: application.examVenue,
+          examCenter: application.examCenter,
+          examDate: application.scheduledDate || new Date(),
+          reportingTime: application.reportingTime,
+          subjects: application.subjects || [],
+        });
+      }
+    } catch (emailErr: any) {
+      console.error('Failed to send schedule published notification:', emailErr);
+    }
+
+    return sendSuccess({
+      req, res,
+      message: 'Exam schedule published successfully. Institute can now generate hall tickets.',
+      data: {
+        _id:                  application._id,
+        status:               application.status,
+        scheduledDate:        application.scheduledDate,
+        examVenue:            application.examVenue,
+        examCenter:           application.examCenter,
+        reportingTime:        application.reportingTime,
+        schedulePublishedAt:  application.schedulePublishedAt,
+        course:               application.course,
+        batch:                application.batch,
+        subjects:             application.subjects,
+        subjectSchedules:     application.subjectSchedules,
+        practicalExam:        application.practicalExam, // NEW: Return practical exam details
+      },
+    });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) throw error;
+    return sendError({ req, res, statusCode: 500, message: error.message });
+  }
+};
+
+// ─── UC 4.3: Generate Hall Tickets (persisted) ───────────────────────────────
+
+export const generateHallTickets = async (req: Request, res: Response) => {
+  try {
+    const application = await ExamApplication.findById(req.params.id)
+      .populate('institute', 'orgName instituteAddress')
+      .populate('course', 'name subjects')
+      .populate('batch', 'name year')
+      .populate('students', 'firstName lastName enrollmentId contactNumber documents');
+
+    if (!application) return sendError({ req, res, statusCode: 404, message: 'Exam application not found' });
+
+    // Role guard for institute
+    if (req.user.role === 'institute') {
+      const owns = await assertOwnership(application, req.user._id);
+      if (!owns) return sendError({ req, res, statusCode: 403, message: 'Unauthorized to access this application' });
+    }
+
+    const allowedStatuses = ['Approved', 'SchedulePublished'];
+    if (!allowedStatuses.includes(application.status)) {
+      return sendError({
+        req, res, statusCode: 400,
+        message: `Hall tickets can only be generated after the exam is approved and scheduled. Current status: "${application.status}".`,
+      });
+    }
+
+    const instituteDoc = application.institute as any;
+    const courseDoc    = application.course    as any;
+    const batchDoc     = application.batch     as any;
+    const studentsArr  = application.students  as any[];
+
+    // These are the fields set by the board/admin in the "publish schedule" step
+    const examVenue        = application.examVenue;
+    const examCenter       = application.examCenter;
+    const reportingTime    = application.reportingTime;
+    const examDate         = application.scheduledDate || new Date();
+    const subjectSchedules = application.subjectSchedules || [];
+    const subjects         = application.subjects || [];
+
+    // NEW: Get practical exam details
+    const practicalExam = application.practicalExam || {
+      name:     '',
+      venue:    '',
+      date:     undefined,
+      time:     '',
+      subjects: []
+    };
+
+    // Require the published schedule details before generating hall tickets
+    if (!examVenue || !examCenter || !reportingTime) {
+      return sendError({
+        req, res, statusCode: 400,
+        message: 'Exam schedule details (venue, center, reporting time) are missing. Please ensure the academic board has published the schedule.',
+      });
+    }
+
+    // Idempotent: delete existing tickets for this application before regenerating
+    await HallTicket.deleteMany({ examApplication: application._id });
+
+    const now       = Date.now();
+    const tickets   = await Promise.all(
+      studentsArr.map(async (student: any) => {
+        const ticketId = `HT-${student.enrollmentId}-${now}`;
+        return HallTicket.create({
+          ticketId,
+          examApplication: application._id,
+          student:         student._id,
+          institute:       application.institute,
+
+          // Student snapshot
+          enrollmentId:  student.enrollmentId,
+          studentName:   `${student.firstName} ${student.lastName}`,
+          contactNumber: student.contactNumber,
+          photoUrl:      student.documents?.passportPhotoUrl,
+
+          // Institute snapshot
+          instituteName:    instituteDoc.orgName,
+          instituteAddress: instituteDoc.instituteAddress,
+
+          // Course / batch snapshot
+          courseName: courseDoc.name,
+          batchYear:  batchDoc.year,
+
+          // Exam details from application
+          examVenue:         examVenue,
+          examCenter:        examCenter,
+          reportingTime:     reportingTime,
+          examDate:          examDate,
+          subjects:          subjects,
+          subjectSchedules:  subjectSchedules,
+
+          // NEW: Practical exam details
+          practicalExam: {
+            name:     practicalExam.name,
+            venue:    practicalExam.venue,
+            date:     practicalExam.date,
+            time:     practicalExam.time,
+            subjects: practicalExam.subjects,
+          },
+        });
+      })
+    );
+
+    // Mark application
+    application.hallTicketsGenerated   = true;
+    application.hallTicketsGeneratedAt = new Date();
+    await application.save();
+
+    return sendSuccess({
+      req, res,
+      message: `${tickets.length} hall ticket(s) generated successfully. Use GET /:id/hall-tickets to retrieve them.`,
+      data: {
+        count:                   tickets.length,
+        hallTicketsGeneratedAt:  application.hallTicketsGeneratedAt,
+        tickets,
+        examDetails: {
+          examVenue,
+          examCenter,
+          reportingTime,
+          examDate,
+          subjectSchedules,
+          subjects,
+          courseName: courseDoc.name,
+          examinationNumber: application.examinationNumber,
+          // NEW: Practical details
+          practicalExam: {
+            name:     practicalExam.name,
+            venue:    practicalExam.venue,
+            date:     practicalExam.date,
+            time:     practicalExam.time,
+            subjects: practicalExam.subjects,
+          },
+        },
+      },
+    });
+  } catch (error: any) {
+    return sendError({ req, res, statusCode: 500, message: error.message });
+  }
+};
+
+// ─── GET All Hall Tickets for an Application ──────────────────────────────────
+
+export const listHallTickets = async (req: Request, res: Response) => {
+  try {
+    const application = await ExamApplication.findById(req.params.id);
+    if (!application) return sendError({ req, res, statusCode: 404, message: 'Exam application not found' });
+
+    // Role guard
+    if (req.user.role === 'institute') {
+      const owns = await assertOwnership(application, req.user._id);
+      if (!owns) return sendError({ req, res, statusCode: 403, message: 'Unauthorized to access this application' });
+    }
+
+    if (!application.hallTicketsGenerated) {
+      return sendError({ req, res, statusCode: 400, message: 'Hall tickets have not been generated yet for this application.' });
+    }
+
+    const tickets = await HallTicket.find({ examApplication: req.params.id })
+      .populate('student', 'firstName lastName enrollmentId')
+      .sort({ enrollmentId: 1 });
+
+    return sendSuccess({
+      req, res,
+      message: `${tickets.length} hall ticket(s) retrieved successfully`,
+      data: tickets,
+    });
+  } catch (error: any) {
+    return sendError({ req, res, statusCode: 500, message: error.message });
+  }
+};
+
+// ─── GET Single Hall Ticket by ID ────────────────────────────────────────────
+
+export const checkExamFeeApplicability = async (req: Request, res: Response) => {
+  try {
+    const studentId = String(req.params.studentId);
+    const examinationNumber = parseInt(String(req.params.examinationNumber));
+
+    const student = await Student.findById(studentId).populate('course');
+    if (!student) return sendError({ req, res, statusCode: 404, message: 'Student not found' });
+
+    const course = student.course || await Course.findById(
+      (student as any).courseId || (student as any).course
+    );
+
+    const status = await checkStudentReappearance(studentId, examinationNumber);
+
+    const feeConfig = course
+      ? resolveFeeConfiguration(course, examinationNumber)
+      : { firstAttemptFee: 0, reappearingFee: 0, feeApplicableForFirstAttempt: false };
+
+    // First attempt: fee applies only when the course opts in AND fee > 0.
+    // Reappearing: fee applies only when the reappearing fee > 0.
+    let examFeeApplicable = false;
+    let examFeeAmount = 0;
+    let applicableFee = '';
+    if (status.isReappearing) {
+      examFeeApplicable = feeConfig.reappearingFee > 0;
+      examFeeAmount = feeConfig.reappearingFee;
+      applicableFee = 'reappearing';
+    } else {
+      examFeeApplicable = feeConfig.feeApplicableForFirstAttempt && feeConfig.firstAttemptFee > 0;
+      examFeeAmount = feeConfig.firstAttemptFee;
+      applicableFee = 'firstAttempt';
+    }
+
+    return sendSuccess({
+      req,
+      res,
+      message: 'Exam fee applicability checked',
+      data: {
+        studentId,
+        examinationNumber,
+        isReappearing: status.isReappearing,
+        attemptCount: status.attemptCount,
+        previousResult: status.previousResult,
+        firstAttemptFee: feeConfig.firstAttemptFee,
+        reappearingFee: feeConfig.reappearingFee,
+        feeApplicableForFirstAttempt: feeConfig.feeApplicableForFirstAttempt,
+        applicableFee,
+        examFeeApplicable,
+        examFeeAmount,
+      },
+    });
+  } catch (error: any) {
+    return sendError({ req, res, statusCode: 500, message: error.message });
+  }
+};
+
+export const getExamFeeConfiguration = async (req: Request, res: Response) => {
+  try {
+    const courseId = String(req.params.courseId);
+    const examinationNumber = parseInt(String(req.params.examinationNumber));
+
+    const course = await Course.findById(courseId);
+    if (!course) return sendError({ req, res, statusCode: 404, message: 'Course not found' });
+
+    const feeConfig = resolveFeeConfiguration(course, examinationNumber);
+
+    return sendSuccess({
+      req,
+      res,
+      message: 'Exam fee configuration retrieved successfully',
+      data: {
+        courseId,
+        examinationNumber,
+        firstAttemptFee: feeConfig.firstAttemptFee,
+        reappearingFee: feeConfig.reappearingFee,
+        feeApplicableForFirstAttempt: feeConfig.feeApplicableForFirstAttempt,
+      },
+    });
+  } catch (error: any) {
+    return sendError({ req, res, statusCode: 500, message: error.message });
+  }
+};
+
+// ─── GET Single Hall Ticket by ID ────────────────────────────────────────────
+
+export const getHallTicketById = async (req: Request, res: Response) => {
+  try {
+    const { id, hid } = req.params;
+
+    const ticket = await HallTicket.findOne({ _id: hid, examApplication: id })
+      .populate('student', 'firstName lastName enrollmentId email')
+      .populate('institute', 'orgName');
+
+    if (!ticket) return sendError({ req, res, statusCode: 404, message: 'Hall ticket not found' });
+
+    // Role guard
+    if (req.user.role === 'institute') {
+      const application = await ExamApplication.findById(id);
+      if (!application) return sendError({ req, res, statusCode: 404, message: 'Exam application not found' });
+      const owns = await assertOwnership(application, req.user._id);
+      if (!owns) return sendError({ req, res, statusCode: 403, message: 'Unauthorized to access this hall ticket' });
+    }
+
+    return sendSuccess({ req, res, message: 'Hall ticket retrieved successfully', data: ticket });
+  } catch (error: any) {
+    return sendError({ req, res, statusCode: 500, message: error.message });
+  }
+};
+
+// ─── Download Hall Ticket (marks isDownloaded=true) ──────────────────────────
+
+export const downloadHallTicket = async (req: Request, res: Response) => {
+  try {
+    const { id, hid } = req.params;
+
+    const ticket = await HallTicket.findOne({ _id: hid, examApplication: id });
+    if (!ticket) return sendError({ req, res, statusCode: 404, message: 'Hall ticket not found' });
+
+    // Role guard
+    if (req.user.role === 'institute') {
+      const application = await ExamApplication.findById(id);
+      if (!application) return sendError({ req, res, statusCode: 404, message: 'Exam application not found' });
+      const owns = await assertOwnership(application, req.user._id);
+      if (!owns) return sendError({ req, res, statusCode: 403, message: 'Unauthorized to download this hall ticket' });
+    }
+
+    // Mark as downloaded
+    if (!ticket.isDownloaded) {
+      ticket.isDownloaded = true;
+      ticket.downloadedAt = new Date();
+      await ticket.save();
+    }
+
+    return sendSuccess({
+      req, res,
+      message: 'Hall ticket data ready for download. Use this data to render a printable PDF.',
+      data: ticket,
+    });
+  } catch (error: any) {
+    return sendError({ req, res, statusCode: 500, message: error.message });
+  }
+};

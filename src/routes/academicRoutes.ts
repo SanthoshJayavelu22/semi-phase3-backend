@@ -1,0 +1,214 @@
+import express from 'express';
+import { protect, authorize } from '../middlewares/authMiddleware';
+import { upload } from '../middlewares/uploadMiddleware';
+import { sendError } from '../utils/responseFormatter';
+import {
+  createCourse,
+  getCourses,
+  getCourseById,
+  updateCourse,
+  deleteCourse,
+  createBatch,
+  getBatches,
+  getBatchById,
+  updateBatch,
+  deleteBatch,
+  getBatchesByCourse,
+  addStudent,
+  checkStudentExists,
+  recordStudentFee,
+  listFeeRecords,
+  getPayableAmount,
+  recordRemittance,
+  listStudents,
+  updateAcademicMetrics,
+  evaluateEligibility,
+  getRemittances,
+  getStudentById,
+  updateStudent,
+  deleteStudent,
+  verifyStudentEnrollment,
+  uploadCourseCertificates,
+  createRazorpayOrder,
+  verifyRazorpayPayment,
+  getAcademicPaymentStatus,
+  verifyAcademicPayment,
+  getExamFeeConfigurationByCourse,
+  updateExamFeeConfiguration,
+  getReappearingStudents,
+} from '../controllers/academicController';
+
+const router = express.Router();
+
+// ==========================================
+// PAYMENT ROUTES (RAZORPAY)
+// ==========================================
+router.post('/payment/create-order', protect, authorize('institute'), createRazorpayOrder);
+router.post('/payment/verify', protect, authorize('institute'), verifyRazorpayPayment);
+
+// Payment status & recovery endpoints
+router.get('/payment/status/:studentId', protect, authorize('institute'), getAcademicPaymentStatus);
+router.get('/payment/verify-order/:orderId', protect, authorize('institute'), verifyAcademicPayment);
+
+// ==========================================
+// EXAM FEE CONFIGURATION (Academy / Board)
+// ==========================================
+router.get('/fee-configuration/:courseId/:examinationNumber', protect, authorize('admin', 'board', 'super_admin', 'institute'), getExamFeeConfigurationByCourse);
+router.put('/fee-configuration', protect, authorize('admin', 'board', 'super_admin'), updateExamFeeConfiguration);
+
+// Reappearing (arreaar) students for a course/batch/examination
+router.get('/students/reappearing', protect, authorize('institute', 'admin', 'board', 'super_admin'), getReappearingStudents);
+
+router.get('/courses', protect, getCourses);
+router.get('/courses/:courseId', protect, getCourseById);
+router.post('/courses', protect, (req, res, next) => {
+  if (req.user?.role === 'institute') {
+    return sendError({ req, res, statusCode: 403, message: 'Institutes are not authorized to create courses. Courses are centrally managed by SEMI Academic Board.' });
+  }
+  next();
+}, createCourse);
+router.put('/courses/:courseId', protect, (req, res, next) => {
+  if (req.user?.role === 'institute') {
+    return sendError({ req, res, statusCode: 403, message: 'Institutes are not authorized to update courses.' });
+  }
+  next();
+}, updateCourse);
+router.delete('/courses/:courseId', protect, (req, res, next) => {
+  if (req.user?.role === 'institute') {
+    return sendError({ req, res, statusCode: 403, message: 'Institutes are not authorized to delete courses.' });
+  }
+  next();
+}, deleteCourse);
+
+// ==========================================
+// BATCH CRUD Routes
+// ==========================================
+router.get('/batches', protect, authorize('institute', 'admin', 'board', 'super_admin'), getBatches);
+router.get('/batches/:batchId', protect, authorize('institute', 'admin', 'board', 'super_admin'), getBatchById);
+router.get('/batches/course/:courseId', protect, authorize('institute', 'admin', 'board', 'super_admin'), getBatchesByCourse);
+router.post('/batches', protect, authorize('institute'), createBatch);
+router.put('/batches/:batchId', protect, authorize('institute', 'admin', 'super_admin'), updateBatch);
+router.delete('/batches/:batchId', protect, authorize('institute', 'admin', 'super_admin'), deleteBatch);
+
+// ==========================================
+// STUDENT MANAGEMENT Routes
+// ==========================================
+// Pre-payment duplicate check (email / medical council reg no)
+router.post(
+  '/students/check-existing',
+  protect,
+  authorize('institute'),
+  checkStudentExists
+);
+
+router.post(
+  '/students',
+  protect,
+  authorize('institute'),
+  upload.fields([
+    { name: 'passportPhoto', maxCount: 1 },
+    { name: 'mbbsCertificate', maxCount: 1 },
+    { name: 'medicalCouncilRegistrationCertificate', maxCount: 1 },
+    { name: 'fmgeResultCopy', maxCount: 1 },
+    { name: 'semiMembershipForm', maxCount: 1 },
+    { name: 'studentSignature', maxCount: 1 },
+    { name: 'hodSignature', maxCount: 1 },
+  ]),
+  addStudent
+);
+
+// ==========================================
+// STUDENT FEE RECORDING Routes
+// ==========================================
+router.get(
+  '/students/:studentId/fees',
+  protect,
+  authorize('institute', 'admin', 'super_admin', 'board'),
+  listFeeRecords
+);
+router.post(
+  '/students/:studentId/fees',
+  protect,
+  authorize('institute'),
+  recordStudentFee
+);
+
+// GET all fee records for the institute
+router.get(
+  '/fees',
+  protect,
+  authorize('institute', 'admin', 'super_admin', 'board'),
+  listFeeRecords
+);
+
+// ==========================================
+// ACADEMY REMITTANCE Routes
+// ==========================================
+router.get('/remittance/payable', protect, authorize('institute'), getPayableAmount);
+router.get('/remittance', protect, authorize('institute', 'admin', 'board', 'super_admin'), getRemittances);
+router.post(
+  '/remittance',
+  protect,
+  authorize('institute'),
+  upload.fields([{ name: 'paymentReceipt', maxCount: 1 }]),
+  recordRemittance
+);
+
+// ==========================================
+// ELIGIBILITY ENGINE Routes
+// ==========================================
+router.get('/students', protect, authorize('institute', 'admin', 'board', 'super_admin'), listStudents);
+router.get('/students/:studentId', protect, authorize('institute', 'admin', 'board', 'super_admin'), getStudentById);
+
+router.put(
+  '/students/:studentId',
+  protect,
+  authorize('institute', 'admin', 'super_admin'),
+  upload.fields([
+    { name: 'passportPhoto', maxCount: 1 },
+    { name: 'mbbsCertificate', maxCount: 1 },
+    { name: 'medicalCouncilRegistrationCertificate', maxCount: 1 },
+    { name: 'fmgeResultCopy', maxCount: 1 },
+    { name: 'semiMembershipForm', maxCount: 1 },
+    { name: 'studentSignature', maxCount: 1 },
+    { name: 'hodSignature', maxCount: 1 },
+    { name: 'nblsCertificate', maxCount: 1 },
+    { name: 'nclsCertificate', maxCount: 1 },
+    { name: 'ntlsCertificate', maxCount: 1 },
+    { name: 'nulsCertificate', maxCount: 1 },
+  ]),
+  updateStudent
+);
+
+router.post(
+  '/students/:studentId/course-certificates',
+  protect,
+  authorize('institute', 'admin', 'super_admin'),
+  upload.fields([
+    { name: 'nblsCertificate', maxCount: 1 },
+    { name: 'nclsCertificate', maxCount: 1 },
+    { name: 'ntlsCertificate', maxCount: 1 },
+    { name: 'nulsCertificate', maxCount: 1 },
+  ]),
+  uploadCourseCertificates
+);
+
+router.delete('/students/:studentId', protect, authorize('institute', 'admin', 'super_admin'), deleteStudent);
+
+router.patch(
+  '/students/:studentId/verify-enrollment',
+  protect,
+  authorize('admin', 'board', 'super_admin'),
+  verifyStudentEnrollment
+);
+
+router.patch(
+  '/students/:studentId/academic-metrics',
+  protect,
+  authorize('institute', 'admin', 'super_admin', 'board'),
+  upload.fields([{ name: 'thesisDocument', maxCount: 1 }]),
+  updateAcademicMetrics
+);
+router.get('/students/:studentId/eligibility', protect, authorize('institute', 'admin', 'board', 'super_admin'), evaluateEligibility);
+
+export default router;

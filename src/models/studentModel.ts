@@ -1,0 +1,259 @@
+import mongoose, { Document, Schema } from 'mongoose';
+
+export interface IStudent extends Document {
+  enrollmentId: string;
+  firstName: string;
+  lastName: string;
+  homeAddress: string;
+  contactNumber: string;
+  email: string;
+  qualification: string;
+  mbbsQualification: string;
+  yearOfPassing: number;
+  universityName: string;
+  medicalCouncilRegistrationNumber: string;
+  isForeignGraduate: boolean;
+  dateOfBirth?: Date;
+  fmgeClearanceStatus?: 'Cleared' | 'Not Applicable' | 'Failed';
+  course: mongoose.Types.ObjectId;
+  batch: mongoose.Types.ObjectId;
+  institute: mongoose.Types.ObjectId;
+  courseDirector: string;
+  razorpayOrderId?: string;
+  razorpayPaymentId?: string;
+  razorpaySignature?: string;
+  attendancePercentage?: number;
+  thesisApproved?: boolean;
+  documents: {
+    passportPhotoUrl: string;
+    mbbsCertificateUrl: string;
+    medicalCouncilRegistrationCertificateUrl: string;
+    fmgeResultCopyUrl?: string;
+    semiMembershipFormUrl: string;
+    studentSignatureUrl?: string;
+    hodSignatureUrl?: string;
+    nblsCertificateUrl?: string;
+    nclsCertificateUrl?: string;
+    ntlsCertificateUrl?: string;
+    nulsCertificateUrl?: string;
+  };
+  remittedToAcademy: boolean;
+  remittanceRecord?: mongoose.Types.ObjectId;
+  verificationStatus: 'Pending Verification' | 'Approved' | 'Rejected' | 'Correction Required';
+  verificationRemarks?: string;
+  verifiedBy?: mongoose.Types.ObjectId;
+  verifiedAt?: Date;
+  correctionRequestedAt?: Date;
+  correctionResubmittedAt?: Date;
+  examinations: {
+    examinationNumber: number;
+    attendancePercentage: number;
+    thesisDocumentUrl?: string;
+    thesisApproved: boolean;
+    eligibilityStatus: 'Pending' | 'Approved' | 'Rejected';
+    marks?: {
+      subjectCode: string;
+      subjectName: string;
+      marksObtained: number | null;
+      totalMarks: number;
+      isAbsent: boolean;
+      grade: string;
+      status?: string;
+      updatedBy?: mongoose.Types.ObjectId;
+      updatedAt?: Date;
+    }[];
+  }[];
+  examAttempts?: {
+    examinationNumber: number;
+    attemptCount: number;
+    lastResultStatus?: string;
+    lastExamDate?: Date;
+  }[];
+}
+
+const studentSchema: Schema = new Schema(
+  {
+    enrollmentId: {
+      type: String,
+      required: true,
+    },
+    firstName: {
+      type: String,
+      required: true,
+    },
+    lastName: {
+      type: String,
+      required: true,
+    },
+    homeAddress: {
+      type: String,
+      required: true,
+    },
+    contactNumber: {
+      type: String,
+      required: true,
+    },
+    email: {
+      type: String,
+      required: true,
+    },
+    qualification: {
+      type: String,
+      required: true,
+    },
+    mbbsQualification: {
+      type: String,
+      required: true,
+    },
+    yearOfPassing: {
+      type: Number,
+      required: true,
+    },
+    universityName: {
+      type: String,
+      required: true,
+    },
+    medicalCouncilRegistrationNumber: {
+      type: String,
+      required: true,
+    },
+    isForeignGraduate: {
+      type: Boolean,
+      required: true,
+      default: false,
+    },
+    dateOfBirth: {
+      type: Date,
+      required: false,
+    },
+    fmgeClearanceStatus: {
+      type: String,
+      enum: ['Cleared', 'Not Applicable', 'Failed'],
+      default: 'Not Applicable',
+    },
+    course: {
+      type: Schema.Types.ObjectId,
+      ref: 'Course',
+      required: true,
+    },
+    batch: {
+      type: Schema.Types.ObjectId,
+      ref: 'Batch',
+      required: true,
+    },
+    institute: {
+      type: Schema.Types.ObjectId,
+      ref: 'Institute',
+      required: true,
+    },
+    courseDirector: {
+      type: String,
+      required: true,
+    },
+    razorpayOrderId: {
+      type: String,
+    },
+    razorpayPaymentId: {
+      type: String,
+    },
+    razorpaySignature: {
+      type: String,
+    },
+    documents: {
+      passportPhotoUrl: { type: String, required: true },
+      mbbsCertificateUrl: { type: String, required: true },
+      medicalCouncilRegistrationCertificateUrl: { type: String, required: true },
+      fmgeResultCopyUrl: { type: String },
+      semiMembershipFormUrl: { type: String, required: true },
+      studentSignatureUrl: { type: String },
+      hodSignatureUrl: { type: String },
+      nblsCertificateUrl: { type: String },
+      nclsCertificateUrl: { type: String },
+      ntlsCertificateUrl: { type: String },
+      nulsCertificateUrl: { type: String },
+    },
+    remittedToAcademy: {
+      type: Boolean,
+      required: true,
+      default: false,
+    },
+    remittanceRecord: {
+      type: Schema.Types.ObjectId,
+      ref: 'Remittance',
+    },
+    verificationStatus: {
+      type: String,
+      enum: ['Pending Verification', 'Approved', 'Rejected', 'Correction Required'],
+      default: 'Pending Verification',
+      required: true,
+    },
+    verificationRemarks: {
+      type: String,
+      default: '',
+    },
+    verifiedBy: {
+      type: Schema.Types.ObjectId,
+      ref: 'User',
+    },
+    verifiedAt: {
+      type: Date,
+    },
+    correctionRequestedAt: {
+      type: Date,
+    },
+    correctionResubmittedAt: {
+      type: Date,
+    },
+    examinations: [
+      {
+        examinationNumber: { type: Number, required: true, enum: [1, 2] },
+        attendancePercentage: { type: Number, required: true, default: 0, min: 0, max: 100 },
+        thesisDocumentUrl: { type: String },
+        thesisApproved: { type: Boolean, required: true, default: false },
+        eligibilityStatus: { 
+          type: String, 
+          enum: ['Pending', 'Approved', 'Rejected'], 
+          default: 'Pending' 
+        },
+        marks: [
+          {
+            subjectCode: { type: String, required: true },
+            subjectName: { type: String, required: true },
+            marksObtained: { type: Number, default: null },
+            totalMarks: { type: Number, default: 100 },
+            isAbsent: { type: Boolean, default: false },
+            grade: { type: String, default: '' },
+            status: { type: String, default: '' },
+            updatedBy: { type: Schema.Types.ObjectId, ref: 'User' },
+            updatedAt: { type: Date, default: Date.now },
+          },
+        ],
+      }
+    ],
+    examAttempts: [
+      {
+        examinationNumber: { type: Number, required: true, enum: [1, 2] },
+        attemptCount: { type: Number, default: 0 },
+        lastResultStatus: { type: String },
+        lastExamDate: { type: Date },
+      },
+    ],
+  },
+  {
+    timestamps: true,
+  }
+);
+
+studentSchema.index({ enrollmentId: 1 }, { unique: true });
+studentSchema.index({ enrollmentId: 1, institute: 1 });
+studentSchema.index({ instituteId: 1, courseId: 1 });
+studentSchema.index({ institute: 1, course: 1 });
+studentSchema.index({ institute: 1, batch: 1 });
+studentSchema.index({ isEligible: 1 });
+studentSchema.index({ email: 1 });
+studentSchema.index({ verificationStatus: 1 });
+studentSchema.index({ 'examinations.eligibilityStatus': 1 });
+
+
+export const Student = mongoose.model<IStudent>('Student', studentSchema);
+
