@@ -57,7 +57,8 @@ export const register = async (req: Request, res: Response) => {
     let emailSent = false;
     let emailError: string | null = null;
     try {
-      const verificationLink = `${req.protocol}://${req.get('host')}/api/auth/verify-email/${verificationToken}`;
+      const baseUrl = process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
+      const verificationLink = `${baseUrl}/api/auth/verify-email/${verificationToken}`;
       await sendEmail({
         email: user.email,
         subject: 'Verify Your Email Address - Semi Phase 3',

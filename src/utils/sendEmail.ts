@@ -30,15 +30,20 @@ const getTransporter = (): Transporter => {
 
 const sendEmail = async (options: EmailOptions): Promise<void> => {
   const mailOptions = {
-    from: `"${process.env.FROM_NAME || 'Semi Phase 3'}" <${process.env.EMAIL_FROM}>`,
+    from: `"${process.env.FROM_NAME || 'Semi Phase 3'}" <${process.env.EMAIL_FROM || process.env.EMAIL_USER}>`,
     to: options.email,
     subject: options.subject,
     text: options.message,
     html: options.html,
   };
 
-  const info = await getTransporter().sendMail(mailOptions);
-  console.log(`[Email] Message sent: ${info.messageId}`);
+  try {
+    const info = await getTransporter().sendMail(mailOptions);
+    console.log(`[Email] Message sent successfully to ${options.email}: ${info.messageId}`);
+  } catch (error: any) {
+    console.error(`[Email ERROR] Failed sending to ${options.email}:`, error.message || error);
+    throw error;
+  }
 };
 
 export default sendEmail;
