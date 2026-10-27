@@ -52,10 +52,10 @@ if (process.env.SENTRY_DSN && Sentry) {
   }
 }
 
-// Connect to database and seed Super Admin & Board Admin accounts
+// Connect to database and seed Super Admin & Dummy Data for Academy and Institute
 const initApp = async () => {
   await connectDB();
-  logger.info('Initializing application and verifying Admin accounts...');
+  logger.info('Initializing application and seeding mock data for Academy & Institute portals...');
   await seedSuperAdmin();
   await Batch.syncIndexes().catch((err: any) => console.log('Batch index sync:', err.message));
 };
@@ -110,8 +110,24 @@ if (responseTime) {
 }
 
 // CORS configuration
+const allowedOrigins = [
+  process.env.CLIENT_URL,
+  process.env.FRONTEND_URL,
+  'https://semi.org.in',
+  'https://www.semi.org.in',
+  'http://localhost:5173',
+  'http://localhost:3000',
+].filter(Boolean) as string[];
+
 const corsOptions = {
-  origin: process.env.CLIENT_URL || 'http://localhost:5173',
+  origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
+    // allow requests with no origin (e.g. mobile apps, curl, server-to-server)
+    if (!origin || allowedOrigins.includes(origin) || allowedOrigins.some(o => origin.startsWith(o))) {
+      callback(null, true);
+    } else {
+      callback(new Error(`Not allowed by CORS: ${origin}`));
+    }
+  },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   credentials: true,
