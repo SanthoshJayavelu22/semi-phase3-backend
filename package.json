@@ -8,7 +8,6 @@
     "build": "tsc",
     "dev": "nodemon src/index.ts",
     "seed": "ts-node src/config/seed.ts",
-    "seed:test": "ts-node src/seed-test-data.ts",
     "migrate:up": "ts-node scripts/run-migration.ts",
     "migrate:create": "ts-node scripts/create-migration.ts",
     "migrate:down": "ts-node scripts/rollback-migration.ts",
