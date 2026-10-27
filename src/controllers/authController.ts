@@ -526,12 +526,18 @@ const successHtml = (name: string) => `
       <p>You can now sign in and begin your institute onboarding journey.</p>
       <div class="divider"></div>
       <a href="${(() => {
-        const raw = process.env.CLIENT_URL || process.env.FRONTEND_URL || '/institute/login';
+        const raw = process.env.CLIENT_URL || process.env.FRONTEND_URL || 'https://semi.org.in/academics';
         try {
-          const parsed = new URL(raw, 'http://localhost:5173');
-          return parsed.href;
+          const urlObj = new URL(raw, 'http://localhost:5173');
+          // If FRONTEND_URL doesn't end with /academics, append it appropriately
+          let basePath = urlObj.pathname.replace(/\/+$/, '');
+          if (!basePath.endsWith('/academics') && !basePath.includes('/academics')) {
+            basePath = `${basePath}/academics`;
+          }
+          urlObj.pathname = `${basePath}/institute/login`.replace(/\/+/g, '/');
+          return urlObj.href;
         } catch {
-          return '/institute/login';
+          return '/academics/institute/login';
         }
       })()}" class="btn">
         Proceed to Login →
@@ -745,7 +751,20 @@ const failureHtml = (reason: string) => `
       <p>We were unable to verify your email address. The link may have already been used or has expired.</p>
       <div class="reason-box">Reason: ${reason}</div>
       <div class="divider"></div>
-      <a href="${process.env.FRONTEND_URL || 'http://localhost:3000'}/register" class="btn">
+      <a href="${(() => {
+        const raw = process.env.CLIENT_URL || process.env.FRONTEND_URL || 'https://semi.org.in/academics';
+        try {
+          const urlObj = new URL(raw, 'http://localhost:5173');
+          let basePath = urlObj.pathname.replace(/\/+$/, '');
+          if (!basePath.endsWith('/academics') && !basePath.includes('/academics')) {
+            basePath = `${basePath}/academics`;
+          }
+          urlObj.pathname = `${basePath}/institute/register`.replace(/\/+/g, '/');
+          return urlObj.href;
+        } catch {
+          return '/academics/institute/register';
+        }
+      })()}" class="btn">
         Register Again
       </a>
       <br/>
